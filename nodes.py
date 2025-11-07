@@ -51,6 +51,18 @@ def parse_json(json_str):
         raise ValueError(f"Unable to load JSON data!\n{e}")
     return parsed
 
+def scale_image(image: torch.Tensor, max_size: int = 128):
+    resized_frames = []
+    img_np = np.clip(255.0 * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8)
+    img_pil = Image.fromarray(img_np)
+    
+    w, h = img_pil.size
+    scale = min(max_size / max(w, h), 1.0)
+    new_w, new_h = int(w * scale), int(h * scale)
+    img_resized = img_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    
+    return np.array(img_resized)
+
 def qwen3bbox(image, json):
     img = Image.fromarray(np.clip(255.0 * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
     bboxes = []
@@ -183,11 +195,15 @@ class llama_cpp_instruct_adv:
                     "tooltip": "Treat the input image sequence as video."
                 }),
                 "max_frames": ("INT", {
-                    "default": 16,
-                    "min": 1,
+                    "default": 24,
+                    "min": 2,
                     "max": 1024,
                     "step": 1,
                     "tooltip": "Number of frames to sample evenly from the video."
+                }),
+                "video_size": ([128, 256, 512, 768, 1024], {
+                    "default": 256,
+                    "tooltip": "Automatically scale down the video size."
                 }),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "step": 1}),
             },
@@ -201,7 +217,7 @@ class llama_cpp_instruct_adv:
     FUNCTION = "process"
     CATEGORY = "llama-cpp-vllm"
     
-    def process(self, llmamodel, parameters, preset_prompt, custom_prompt, system_prompt, video_input, max_frames, seed, images=None):
+    def process(self, llmamodel, parameters, preset_prompt, custom_prompt, system_prompt, video_input, max_frames, video_size, seed, images=None):
         mm.soft_empty_cache()
         keep_model_loaded = llmamodel['keep_model_loaded']
 
@@ -222,7 +238,11 @@ class llama_cpp_instruct_adv:
             messages.append({"role": "system", "content": system_prompts})
             
         user_content = []
-        
+        if custom_prompt.strip():
+            user_content.append({"type": "text", "text": custom_prompt})
+        else:
+            user_content.append({"type": "text", "text": preset_prompts[preset_prompt].replace("@", "video" if video_input else "image")})
+            
         if images is not None:
             if not hasattr(self.chat_handler, "clip_model_path") or self.chat_handler.clip_model_path is None:
                  raise ValueError("Image input detected, but the loaded model is not configured with a vision module (mmproj).")
@@ -233,25 +253,21 @@ class llama_cpp_instruct_adv:
                 frames = [images[i] for i in indices]
                 
             for image in frames:
-                data = image2base64(np.clip(255.0 * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
+                if video_input:
+                    data = image2base64(scale_image(image, video_size))
+                else:
+                    data = image2base64(np.clip(255.0 * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
                 image_content = {
                     "type": "image_url",
                     "image_url": {"url": f"data:image/jpeg;base64,{data}"}
                 }
                 user_content.append(image_content)
-        
-        if custom_prompt.strip():
-            user_content.append({"type": "text", "text": custom_prompt})
-        else:
-            user_content.append({"type": "text", "text": preset_prompts[preset_prompt].replace("@", "video" if video_input else "image")})
-        
+
         messages.append({"role": "user", "content": user_content})
         
-        output = self.llm.create_chat_completion(
-            messages=messages,
-            seed=seed,
-            **parameters
-        )
+        output = self.llm.create_chat_completion(messages=messages, seed=seed, **parameters)
+        text = output['choices'][0]['message']['content']
+        text = text[2:].lstrip() if text.startswith(": ") else text.lstrip() 
         
         if not keep_model_loaded:
             self.llm.close()
@@ -262,12 +278,6 @@ class llama_cpp_instruct_adv:
             del self.llm, self.chat_handler
             gc.collect()
             mm.soft_empty_cache()
-            
-        text = output['choices'][0]['message']['content']
-        
-        if text.startswith(": "):
-            text = text[2:]
-        text = text.lstrip() 
         
         return (text,)
 
